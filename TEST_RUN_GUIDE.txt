@@ -1,0 +1,156 @@
+microbiome-nf — how to run the tests on CHPC
+=============================================
+
+The test scripts are in tests/chpc/. Each prints a PASS or FAIL line per check and exits
+non-zero if anything failed. None of them have been run yet (no Nextflow on the Mac where
+they were written), so expect to fix small things on the first try.
+
+Run order: Step 0 setup -> Tier 0 -> Tier 1 -> Tier 2 -> Tier 3 -> Tier 4.
+Tiers 0 and 1 take about 30 minutes in total; do them first.
+
+
+Step 0. One-time setup
+----------------------
+1. Copy the repo to CHPC (git clone, or rsync from the Box folder). Do not run from Box.
+     rsync -av microbiome-nf/ <uNID>@notchpeak.chpc.utah.edu:~/microbiome-nf/
+
+2. Log in and go to the repo root. ALL commands below are run from the repo root, because
+   the test samplesheets use relative paths (tests/data/...).
+     cd ~/microbiome-nf
+
+3. Restore executable bits (Box copies often drop them):
+     chmod +x bin/* tests/chpc/*.sh tests/chpc/*.sbatch
+
+4. Nextflow 25.10 or later:
+     module load nextflow && nextflow -version
+     # if older:  curl -s https://get.nextflow.io | bash && mv nextflow ~/bin/
+
+5. Edit tests/chpc/env.sh (lines between the EDIT markers):
+     ACCOUNT / PARTITION   your Slurm account and partition (default hci-kp)
+     DB                    database root (= params.db_root in conf/chpc.config)
+     CLASSIFIER            a real QIIME 2 2026.7 classifier .qza (needed for Tier 2)
+     TEST_ROOT             scratch folder for all test work and output,
+                           e.g. /scratch/general/vast/$USER/mbnf_test
+     SHOTGUN_SHEET         leave as is; written by make_subsets.sh in Tier 3
+
+6. If your account/partition is not hci-kp, also change the "#SBATCH --account" and
+   "#SBATCH --partition" lines at the top of the .sbatch files and make_subsets.sh,
+   and the EDIT lines in conf/chpc.config.
+
+7. Databases must already exist (one-time):  sbatch scripts/setup_databases.sh
+
+
+Tier 0. Environment preflight (login node, minutes; first container pull ~30 min)
+--------------------------------------------------------------------------------
+     bash tests/chpc/00_preflight.sh --pull
+
+Checks: Nextflow version, apptainer, Slurm account; bin/* executable; `nextflow lint`;
+config resolves with -profile chpc; every database, the host and PhiX indexes and every fastq_screen
+genome exists; HUMAnN utility_mapping file names; every pinned container pulls into the
+shared cache and contains the tools the pipeline calls (e.g. bowtie2 inside the
+fastq_screen image).
+Without --pull it only checks files and config (fast).
+
+Typical fixes: chmod +x bin/*; wrong account in conf/chpc.config; missing database ->
+run scripts/setup_databases.sh; probe failure in an image -> pick another container tag
+in conf/containers.config.
+
+
+Tier 1. Dry runs + input validation (login node, ~10 min)
+--------------------------------------------------------
+     bash tests/chpc/01_stub_and_validation.sh
+
+No containers, databases or Slurm. Checks:
+  a) the repo's own tests/run_stub_tests.sh passes
+  b) dry runs again with -profile chpc (catches clashes between conf/chpc.config
+     parameters and the entry scripts), and sample routing:
+       - MetaPhlAn runs for P1_DNA, P2_DNA, P3_RNA but NOT P1_RNA (it borrows P1_DNA's)
+       - HUMAnN runs for all 4 samples
+       - MERGE_LANES runs only for the 2-lane sample
+       - --skip_humann and --optical_dedup false really skip those steps
+       - the PhiX pass runs when --phix_index is set, and the run still works with --phix_index ''
+  c) 14 bad inputs must fail early with a clear message (misspelled parameter, no input,
+     missing classifier, bad sample name, missing FASTQ, missing column, same sample in
+     two runs, bad RNA pair_id, bad type, bad host index, bad PhiX index, RNA without --sortmerna_ref)
+
+Logs: $TEST_ROOT/stub_*.log and $TEST_ROOT/expect_fail.log (last validation case).
+
+
+Tier 2. Real amplicon run on bundled mini data (Slurm, ~1 h, mostly queueing)
+----------------------------------------------------------------------------
+     sbatch tests/chpc/02_amplicon_mini.sbatch
+     tail -f mbnf_t2_amplicon.<jobid>.log
+
+The Slurm job only hosts Nextflow; each task is submitted as its own Slurm job.
+Data: 3 samples in 2 runs, 500 synthetic V3-V4 read pairs per file (primers present).
+S1 has 2 identical lanes; runB has only one sample (S3).
+
+What it does and checks:
+  Pass 1 (no truncation lengths): must stop before DADA2. Checks trunc_suggestion.tsv
+         (status OK), demux .qza/.qzv for runA and runB, MultiQC report, no dada2 folder,
+         cutadapt keeps >= 90% of pairs.
+  Pass 2 (-resume with the suggested lengths, --sampling_depth 100):
+         pass-1 tasks are CACHED (not re-run); DADA2 ran twice (once per run); all
+         QIIME 2 artifacts are valid archives; all exports and visualizations exist;
+         diversity outputs exist; dada2_stats has 3 samples; S1 input ~2x S2 (lane join);
+         ASVs > 0; S3 (single-sample run) is in the final table.
+  Auto run (--reads file pattern + --auto_trunc): finishes in one go; samples S1 S2 S3.
+
+Results: $TEST_ROOT/amp and $TEST_ROOT/amp_auto.
+If 0 ASVs survive the taxonomy filter, the synthetic reads probably did not classify;
+rerun pass 2 with --include_taxa '' — that is a property of the fake data, not a bug.
+If QIIME_IMPORT fails for runB, that is the single-sample transpose() risk noted in
+PIPELINE_EXPLANATION.txt.
+
+
+Tier 3. Real shotgun run on a subsampled real project (Slurm, 3-8 h)
+-------------------------------------------------------------------
+The bundled shotgun reads and databases are placeholders, so use a real project.
+
+1. Make a samplesheet of a previously processed project with, ideally:
+     >= 2 DNA samples (one with 2 lanes), 1 RNA row with pair_id, 1 RNA row without.
+2. Subsample it to 1,000,000 read pairs per file (uses the pipeline's BBMap container):
+     sbatch tests/chpc/make_subsets.sh /path/real_shotgun_sheet.csv 1000000 $TEST_ROOT/subset
+   This writes $TEST_ROOT/subset/<sheet>_subset.csv. Point SHOTGUN_SHEET in env.sh at it.
+3. Run:
+     sbatch tests/chpc/03_shotgun_mini.sbatch
+     tail -f mbnf_t3_shotgun.<jobid>.log
+
+What it checks:
+  Run 1 (--skip_humann): read_tracking.tsv has every sample, counts never go up between
+         steps, reads remain after host removal; RNA samples have rRNA-removal counts;
+         SortMeRNA index cached in db_cache; MetaPhlAn profiles for DNA + unpaired RNA
+         only; > 5 species detected; profiles use mpa_vJun23_CHOCOPhlAnSGB_202403;
+         no HUMAnN output yet.
+  Run 2 (same command with HUMAnN, -resume): fastp / host removal / SortMeRNA / MetaPhlAn
+         are CACHED; HUMAnN ran for every sample; paired RNA used its DNA partner's
+         MetaPhlAn profile; humann_DNA/ and humann_RNA/ have all tables incl. ko_cpm and
+         level4ec_cpm with KO names, stratified/unstratified splits; no sample > 90%
+         UNMAPPED (may be too strict for small RNA subsets — judge by eye).
+
+Results: $TEST_ROOT/sg.
+
+
+Tier 4. Old vs new comparison (manual, one real project each)
+-------------------------------------------------------------
+Run the same full project through the old and the new pipeline.
+  Amplicon: compare reads per sample after DADA2 (qiime2/dada2/dada2_stats.tsv), ASV
+            counts, and genus-level relative abundance (exported/genus_table.tsv);
+            expect Spearman rho > 0.9 per sample. Check shifts in Mitochondria /
+            Chloroplast (the new filter is taxonomy-based).
+  Shotgun:  compare read_tracking.tsv with old kneaddata counts (new keeps slightly fewer
+            reads: poly-G trimming and pair-aware host removal); MetaPhlAn species
+            correlation per sample (rho > 0.9); HUMAnN unstratified pathway relab —
+            some differences are expected from the prescreen threshold change.
+
+
+Where to look when something fails
+----------------------------------
+  Test logs:        $TEST_ROOT/*.log
+  Slurm head logs:  mbnf_*.<jobid>.log in the repo root
+  Nextflow log:     .nextflow.log in the repo root
+  Failed task:      the work dir printed in the error; inside it read .command.sh,
+                    .command.err, .command.log
+  Task status:      nextflow log last -f name,status,workdir
+
+Clean up afterwards:  rm -rf $TEST_ROOT

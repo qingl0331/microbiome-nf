@@ -1,0 +1,11 @@
+# Nextflow run state and outputs
+.nextflow/
+.nextflow.log*
+work/
+pipeline_info/
+results/
+*.log
+
+# OS / editor clutter
+.DS_Store
+*.swp

@@ -1,0 +1,154 @@
+microbiome-nf — how the pipeline works
+=======================================
+
+Overview
+--------
+A Nextflow (version 25.10 or later) rewrite of the CBI microbiome pipelines.
+There are three entry scripts; run one per command. Every tool runs from a pinned public
+container (Apptainer on CHPC), so nothing depends on `module load` or hard-coded binary paths.
+
+  amplicon.nf          16S / amplicon (QIIME 2 + DADA2)
+  shotgun.nf           shotgun metagenome and metatranscriptome (MetaPhlAn + HUMAnN)
+  train_classifier.nf  one-time naive Bayes classifier training for QIIME 2 2026.7
+
+
+1. amplicon.nf (16S)
+--------------------
+Steps, in order:
+
+  1. Primer trimming (CUTADAPT_PRIMERS)
+     Primers are matched by sequence, not cut at a fixed length. A read pair is thrown out
+     unless both primers are found. A second pass trims read-through into the opposite
+     primer. Lanes of the same sample are joined first.
+  2. QC report (FASTQ_SCREEN, optional)
+     Checks for contamination and only reports it in MultiQC. It does not remove reads.
+  3. Truncation suggestion (SUGGEST_TRUNC, bin/suggest_trunc.py)
+     Picks DADA2 cut lengths from the per-position median quality, how many reads are long
+     enough to survive truncation, and how much the two reads must overlap to merge
+     (--amplicon_length + --min_overlap).
+  4. Import (QIIME_IMPORT)
+     One QIIME 2 import per sequencing run (the `run` column), plus a demux summary .qzv.
+  5. Denoising (DADA2_DENOISE, then MERGE_RUNS)
+     DADA2 runs separately for each run, because its error models are specific to a run.
+     MERGE_RUNS then combines the tables and sequences. ASVs are exact sequences, so the
+     merge is exact.
+  6. Taxonomy (CLASSIFY, then FILTER_TAXA)
+     classify-sklearn assigns taxonomy. FILTER_TAXA drops mitochondria, chloroplasts and
+     eukaryotes, plus ASVs without a phylum call (--exclude_taxa / --include_taxa).
+  7. Tree and outputs (PHYLOGENY, QIIME_VISUALIZE, EXPORT_TABLES)
+     MAFFT + FastTree build the tree. The pipeline writes .qzv files (summaries, taxa barplot)
+     and plain exports: feature table TSV and BIOM, taxonomy TSV, ASV FASTA, Newick tree and
+     a genus table. bin/make_phyloseq.R turns the exports into a phyloseq object in R.
+  8. Diversity (DIVERSITY, optional)
+     core-metrics-phylogenetic and alpha rarefaction. Runs only when --sampling_depth > 0.
+
+It is designed to run twice:
+  Pass 1: run without truncation lengths. It stops after QC and the suggestion.
+          Read results/trunc/trunc_suggestion.txt and the demux .qzv files.
+  Pass 2: run the same command with -resume --trunc_f <F> --trunc_r <R>.
+          Everything from pass 1 is reused.
+  Or use --auto_trunc to take the suggestion directly and do both in one run.
+
+Input is either a samplesheet (--input, columns sample,fastq_1,fastq_2[,run]) or a file
+pattern (--reads; sample name = text before the first "_"). Repeated sample rows are
+treated as lanes and joined.
+
+
+2. shotgun.nf (metagenome and metatranscriptome)
+------------------------------------------------
+Samplesheet columns: sample,fastq_1,fastq_2,type,pair_id
+  type    = DNA (default) or RNA
+  pair_id = for an RNA row, the sample name of its matched DNA library (optional)
+
+Steps, in order:
+
+  1. MERGE_LANES (only for samples with more than one lane), then CLUMPIFY
+     CLUMPIFY removes optical duplicates (--optical_dedup; dupedist 12000 for NovaSeq).
+  2. FASTP
+     Trims adapters, low quality (window Q20) and poly-G tails; drops reads under 50 bp.
+  3. HOST_REMOVE
+     Bowtie2 against any host index (--host_index; human hg38 by default). A pair is kept
+     only if both reads miss the host genome. Then a second bowtie2 pass removes PhiX
+     spike-in reads (--phix_index; set in conf/chpc.config, '' to skip). Added 2026-10-20:
+     the old kneaddata step removed hg38 + PhiX. read_tracking.tsv has a phix_removed column.
+  4. SORTMERNA (RNA samples only)
+     Removes rRNA. Its index is built once by SORTMERNA_INDEX and cached in db_cache
+     (storeDir), so it is not rebuilt for every sample.
+  5. FASTQ_SCREEN (optional)
+     Contamination QC report only.
+  6. METAPHLAN (taxonomy)
+     MetaPhlAn 4.1.1 with the mpa_vJun23_CHOCOPhlAnSGB_202403 database. Runs on every DNA
+     sample, and on RNA samples that have no matched DNA sample. MERGE_METAPHLAN builds
+     merged and species-only tables.
+  7. HUMANN (function; skip with --skip_humann)
+     HUMAnN 3.9 using a precomputed MetaPhlAn profile. An RNA sample with a pair_id uses
+     its matched DNA sample's profile.
+  8. MERGE_HUMANN
+     Joins the per-sample tables, converts to CPM and relative abundance, regroups to KEGG
+     KO and EC (when the utility database is given) with names attached, and splits
+     stratified and unstratified versions.
+  9. READ_TRACKING and MULTIQC
+     READ_TRACKING (bin/read_tracking.py) writes qc/read_tracking.tsv: read pairs per
+     sample after each step. MultiQC summarises QC.
+
+
+3. train_classifier.nf
+----------------------
+A one-time job. It imports the reference sequences and taxonomy, optionally extracts the
+primer region (--primer_f/--primer_r), and trains a naive Bayes classifier. A classifier
+must be trained with the same scikit-learn version as the QIIME 2 container, which is why
+this is needed (for example for Greengenes2, which has no 2026.x pre-trained classifier).
+
+
+4. Supporting files
+-------------------
+  modules/common.nf      Reads and checks the samplesheet (or file pattern); FASTQ_SCREEN
+                         and MULTIQC processes shared by both pipelines.
+  modules/amplicon.nf    Amplicon processes (all in the QIIME 2 2026.7 container).
+  modules/shotgun.nf     Shotgun processes.
+  conf/base.config       Default resources by label. Jobs killed for memory or time are
+                         retried up to twice with more resources.
+  conf/chpc.config       CHPC settings: Slurm partition and account, resourceLimits,
+                         database paths, Apptainer bind mounts and image cache.
+  conf/containers.config Pinned container for each process (one place to bump versions).
+  conf/modules.config    Tool arguments (ext.args) you can tune with a -c custom.config.
+  scripts/setup_databases.sh  One-time Slurm job that downloads the MetaPhlAn, HUMAnN and
+                         SortMeRNA databases using the same containers as the pipeline.
+  tests/run_stub_tests.sh     Dry runs (-stub) of every entry point; no containers or DBs.
+  tests/chpc/            CHPC test suite (see tests/chpc/README.md).
+
+Parameters and their defaults are declared at the top of each entry script (params.x = ...);
+checkParams() rejects unknown --options, so a misspelled parameter (e.g. --trunclen) fails
+immediately instead of being ignored.
+
+
+5. Output layout
+----------------
+  amplicon:  qc/  trunc/  qiime2/{demux,dada2,artifacts,visualizations,diversity}/  exported/
+  shotgun:   qc/ (MultiQC, fastp html, read_tracking.tsv)  metaphlan/  metaphlan/per_sample/
+             humann_DNA/  humann_RNA/  humann_logs/
+  pipeline_info/ (timeline, report, trace) in the launch directory
+
+
+6. Example commands (CHPC)
+--------------------------
+  nextflow run amplicon.nf -profile chpc -work-dir /scratch/general/<fs>/$USER/work_PROJ \
+      --input samples.csv --classifier $DB/qiime2_2026.7/classifiers/SILVA_144_SSURef_NR99_uniform_classifier_V3V4-341f-806r.qza -output-dir results
+  nextflow run amplicon.nf ... -resume --trunc_f 250 --trunc_r 210 [--sampling_depth 10000]
+
+  nextflow run shotgun.nf -profile chpc -work-dir /scratch/... --input samples.csv -output-dir results
+      --skip_humann                              taxonomy only
+      --host_index /path/mm10.standard   mouse host
+
+
+7. Things to watch on first runs
+--------------------------------
+  - QIIME_IMPORT with a run that has only one sample: [ids, r1s, r2s].transpose() may get a
+    single file instead of a list. Dry runs do not execute this code; tests/chpc Tier 2 does.
+  - The fastq_screen container may not include bowtie2 (checked by 00_preflight.sh --pull).
+  - conf/chpc.config sets params (db_root, HUMAnN paths) not declared in amplicon.nf; the
+    unknown-parameter check (checkParams) only looks at the command line, so these are fine (checked by Tier 1).
+  - Copying through Box can drop the executable bit on bin/*: run chmod +x bin/*.
+  - Primers: if far fewer than ~90% of pairs pass cutadapt, the primer sequences or
+    orientation are wrong for the kit.
+  - Run the Nextflow head process as a small Slurm job rather than on a login node.

@@ -1,0 +1,6 @@
+sample,fastq_1,fastq_2,type,pair_id
+P1_DNA,tests/data/S1_L001_R1_001.fastq.gz,tests/data/S1_L001_R2_001.fastq.gz,DNA,
+P1_DNA,tests/data/S1_L002_R1_001.fastq.gz,tests/data/S1_L002_R2_001.fastq.gz,DNA,
+P2_DNA,tests/data/S2_L001_R1_001.fastq.gz,tests/data/S2_L001_R2_001.fastq.gz,DNA,
+P1_RNA,tests/data/S3_L001_R1_001.fastq.gz,tests/data/S3_L001_R2_001.fastq.gz,RNA,P1_DNA
+P3_RNA,tests/data/S3_L001_R1_001.fastq.gz,tests/data/S3_L001_R2_001.fastq.gz,RNA,
